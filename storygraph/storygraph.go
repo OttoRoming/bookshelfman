@@ -69,7 +69,6 @@ func New() (*Storygraph, error) {
 	// check that we got the cookie we need to access the site
 	found := false
 	for _, cookie := range jar.Cookies(resp.Request.URL) {
-		fmt.Printf("cookie: %v\n", cookie)
 		if cookie.Name == "_storygraph_marketing_session" {
 			found = true
 			break

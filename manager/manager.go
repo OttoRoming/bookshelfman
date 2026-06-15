@@ -28,19 +28,25 @@ type Book struct {
 
 type Manager struct {
 	config Config
-	books  []Book
-	slog   *slog.Logger
+	// books  []Book
+	slog *slog.Logger
 }
 
 func New() (*Manager, error) {
 	s := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	_, err := os.ReadFile(configPath)
+	f, err := os.Open(configPath)
 	if err != nil {
 		s.Error("Failed to read config file, to intitialize bookshelfman run `bookshelfman init <path>`", "path", configPath, "error", err)
 	}
 
-	return &Manager{}, nil
+	var config Config
+	toml.NewDecoder(f).Decode(&config)
+
+	return &Manager{
+		config: config,
+		slog:   s,
+	}, nil
 }
 
 func Init(path string) {
