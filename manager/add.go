@@ -14,6 +14,8 @@ type BookAddModel struct {
 	storygraph *storygraph.Storygraph
 	textInput  textinput.Model
 	query      string
+	bookPanes  []storygraph.BookPane
+	err        error
 }
 
 func initialBookAddModel() (BookAddModel, error) {
@@ -25,11 +27,13 @@ func initialBookAddModel() (BookAddModel, error) {
 		return BookAddModel{}, err
 	}
 
-	return BookAddModel{
+	model := BookAddModel{
 		storygraph: s,
 		textInput:  ti,
 		query:      "",
-	}, nil
+	}
+
+	return model, nil
 }
 
 func (m BookAddModel) Init() tea.Cmd {
@@ -44,16 +48,16 @@ func (m BookAddModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			return m, tea.Quit
-		case "backspace":
-			if len(m.query) > 0 {
-				m.query = m.query[:len(m.query)-1]
-			}
-		default:
-			m.query += msg.Key().Text
 		}
 	}
 
 	m.textInput, cmd = m.textInput.Update(msg)
+
+	if m.query != m.textInput.Value() {
+		m.query = m.textInput.Value()
+		m.bookPanes, m.err = m.storygraph.Search(m.query)
+	}
+
 	return m, cmd
 }
 
@@ -64,7 +68,7 @@ func (m BookAddModel) View() tea.View {
 		c.Y += lipgloss.Height(m.headerView())
 	}
 
-	str := lipgloss.JoinVertical(lipgloss.Top, m.headerView(), m.textInput.View(), m.footerView())
+	str := lipgloss.JoinVertical(lipgloss.Top, m.headerView(), m.textInput.View(), m.bookPanesView(), m.footerView())
 
 	v := tea.NewView(str)
 	v.Cursor = c
@@ -72,7 +76,20 @@ func (m BookAddModel) View() tea.View {
 }
 
 func (m BookAddModel) headerView() string { return "Search for the book you are adding" }
-func (m BookAddModel) footerView() string { return "\n(esc to quit)" }
+func (m BookAddModel) bookPanesView() string {
+	var panes []string
+	for _, pane := range m.bookPanes {
+		panes = append(panes, pane.Title)
+	}
+	return lipgloss.JoinVertical(lipgloss.Top, panes...)
+}
+func (m BookAddModel) footerView() string {
+	s := "\n(esc to quit)"
+	if m.err != nil {
+		s += " - " + m.err.Error()
+	}
+	return s
+}
 
 func (m *Manager) Add(paths []string) error {
 	// Check if files exists
