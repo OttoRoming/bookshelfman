@@ -1,11 +1,9 @@
 mod api;
-mod cache;
 mod client;
 mod error;
 mod search;
 
 pub use api::{Author, Book, BookPane};
-pub use cache::Cache;
 pub use client::Storygraph;
 pub use error::{Error, Result};
 

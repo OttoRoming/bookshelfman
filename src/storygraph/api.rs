@@ -1,10 +1,11 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
 /// An author on StoryGraph.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Author {
     pub id: Uuid,
     pub name: String,
@@ -17,7 +18,7 @@ impl fmt::Display for Author {
 }
 
 /// A book together with its resolved authors.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Book {
     pub id: Uuid,
     pub title: String,
@@ -39,7 +40,7 @@ impl fmt::Display for Book {
 }
 
 /// A single search result as scraped from StoryGraph's browse page.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BookPane {
     pub id: Uuid,
     pub authors: Vec<Uuid>,
