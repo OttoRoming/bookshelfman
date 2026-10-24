@@ -80,7 +80,7 @@ mod tests {
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
 
-    const PAGE_COUNT: usize = 3;
+    const CHAPTER_COUNT: usize = 3;
     const COVER: &[u8] = b"\xff\xd8\xff\xe0fake jpeg cover\xff\xd9";
 
     const CONTAINER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -139,7 +139,7 @@ mod tests {
             ""
         };
 
-        let chapter_items = (0..PAGE_COUNT)
+        let chapter_items = (0..CHAPTER_COUNT)
             .map(|index| {
                 format!(
                     r#"<item id="chapter-{index}" href="chapter-{index}.xhtml" media-type="application/xhtml+xml"/>"#
@@ -147,7 +147,7 @@ mod tests {
             })
             .collect::<String>();
 
-        let spine_items = (0..PAGE_COUNT)
+        let spine_items = (0..CHAPTER_COUNT)
             .map(|index| format!(r#"<itemref idref="chapter-{index}"/>"#))
             .collect::<String>();
 
@@ -176,7 +176,7 @@ mod tests {
             write_entry(&mut zip, "OEBPS/images/cover.jpg", deflated, cover);
         }
 
-        for index in 0..PAGE_COUNT {
+        for index in 0..CHAPTER_COUNT {
             let chapter = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><body><p>Chapter {index}</p></body></html>"#
@@ -203,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_title_page_count_and_cover() {
+    fn reads_title_and_cover() {
         let dir = TempDir::new();
         let path = dir.0.join("The Dispossessed.epub");
         write_epub(&path, Some("The Dispossessed"), Some(COVER), true);
@@ -211,7 +211,7 @@ mod tests {
         let book = BookData::open(&path).unwrap();
 
         assert_eq!(book.title, "The Dispossessed");
-        assert_eq!(book.page_count, PAGE_COUNT);
+        assert_eq!(book.page_count, None);
         assert_eq!(
             book.cover,
             Some(CoverImage {

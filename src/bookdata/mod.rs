@@ -10,7 +10,7 @@
 //! use bookshelfman::bookdata::BookData;
 //!
 //! let book = BookData::open("/home/user/Books/dispossessed.epub")?;
-//! println!("{} ({} pages)", book.title, book.page_count);
+//! println!("{}", book.title);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
@@ -37,7 +37,6 @@ impl Format {
 
         match extension.to_ascii_lowercase().as_str() {
             "epub" => Some(Self::Epub),
-            // "pdf" => Some(Self::Pdf),
             _ => None,
         }
     }
@@ -48,7 +47,6 @@ impl Format {
 
         match self {
             Self::Epub => epub::read(path),
-            // Self::Pdf => pdf::read(path),
         }
     }
 }
@@ -59,7 +57,7 @@ pub struct BookData {
     /// The title of the book.
     pub title: String,
 
-    /// The number of pages in the book.
+    /// The number of pages in the book, when the format provides it.
     pub page_count: Option<usize>,
 
     /// The cover image, when the file contains one.
