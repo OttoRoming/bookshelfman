@@ -254,6 +254,15 @@ impl Input {
         self.cursor = 0;
     }
 
+    /// Replaces the value and moves the cursor to the end.
+    pub(crate) fn set_value(&mut self, value: impl Into<String>) {
+        self.value.clear();
+        self.cursor = 0;
+
+        let value = value.into();
+        self.insert_str(&value);
+    }
+
     pub(crate) fn move_left(&mut self) {
         if let Some(previous) = self.previous_boundary() {
             self.cursor = previous;
@@ -517,6 +526,15 @@ mod tests {
         input.insert_str("one\ntwo\tthree");
 
         assert_eq!(input.value, "one two three");
+    }
+
+    #[test]
+    fn setting_a_value_moves_the_cursor_to_the_end() {
+        let mut input = Input::default();
+        input.set_value("the great gatsby");
+
+        assert_eq!(input.value, "the great gatsby");
+        assert_eq!(input.cursor, input.value.len());
     }
 
     #[test]

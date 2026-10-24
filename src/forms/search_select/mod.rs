@@ -1,14 +1,19 @@
 //! A searchable single-select form rendered inline.
 //!
-//! [`SearchSelect`] takes a prompt and a list of [`SelectItem`]s, lets the user
-//! filter the list by typing, and returns the selected item. It is similar in
+//! [`SearchSelect`] takes a prompt and either a fixed list of [`SelectItem`]s
+//! or a search callback, and returns the selected item. It is similar in
 //! spirit to `inquire`'s select prompt or Go's `huh` select field, with one
 //! important difference: the form renders at the current cursor row and
 //! **never enters the alternate screen**. Existing terminal output stays
 //! visible above the form.
 //!
+//! With a fixed list, typing filters the list locally. With a search callback,
+//! typing starts a debounced search on a worker thread and the form shows an
+//! animated spinner until the results arrive. Callback errors are displayed in
+//! the results pane.
+//!
 //! Items may expose [`Metadata`] (shown in a preview pane and included in
-//! search matching), and a thumbnail callback can provide an arbitrary
+//! local search matching), and a thumbnail callback can provide an arbitrary
 //! terminal-text preview for the highlighted item:
 //!
 //! ```no_run
@@ -50,11 +55,29 @@
 //! # }
 //! ```
 //!
+//! To load items on demand, use [`SearchSelect::search`] or
+//! [`SearchSelect::with_search`]. The callback runs on a worker thread, so it
+//! may block (for example on network or disk I/O):
+//!
+//! ```no_run
+//! use bookshelfman::forms::SearchSelect;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let selected = SearchSelect::search("Search", |query| {
+//!     Ok(vec![format!("result for {query}")])
+//! })
+//! .with_initial_query("gatsby")
+//! .run()?;
+//! # let _ = selected;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Controls
 //!
 //! | Key | Action |
 //! | --- | --- |
-//! | Type | Filter the list |
+//! | Type | Filter the list, or run the search callback |
 //! | <kbd>↑</kbd> / <kbd>↓</kbd> | Move the selection |
 //! | <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | Move a page at a time |
 //! | <kbd>←</kbd> / <kbd>→</kbd> | Move the input cursor |
@@ -79,6 +102,9 @@ pub use thumbnail::Thumbnail;
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Position;
@@ -91,6 +117,16 @@ use terminal::Session;
 const DEFAULT_PAGE_SIZE: usize = 8;
 /// The largest number of result rows that can be requested.
 const MAX_PAGE_SIZE: usize = 50;
+
+/// How long to wait after a query change before invoking the search callback.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+/// How often to poll for search results and advance the spinner.
+const SEARCH_TICK: Duration = Duration::from_millis(80);
+/// How long an idle form waits for input.
+const IDLE_POLL: Duration = Duration::from_secs(3_600);
+
+/// Frames for the search spinner.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Errors returned by a search select form.
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +158,12 @@ pub enum Error {
 /// A convenience result type for search select operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// An error returned by a search callback.
+///
+/// Errors are displayed in the form's result area, and the user can keep
+/// editing the query to retry.
+pub type SearchError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 /// How the event loop finished.
 enum Outcome {
     Selected(usize),
@@ -131,16 +173,29 @@ enum Outcome {
 /// Builds a thumbnail for an item. See [`SearchSelect::with_thumbnail`].
 type ThumbnailCallback<'a, T> = Box<dyn Fn(&T) -> Option<Thumbnail> + 'a>;
 
+/// The query and result sent back from a search worker.
+type SearchMessage<T> = (String, std::result::Result<Vec<T>, SearchError>);
+
+/// Spawns a search worker for a query and returns its result channel.
+type SearchSpawner<T> = Arc<dyn Fn(String) -> Receiver<SearchMessage<T>> + Send + Sync>;
+
 /// An inline searchable select form.
 ///
-/// Build the form with [`SearchSelect::new`], optionally attach a thumbnail
-/// callback and other options, then call [`run`](SearchSelect::run).
+/// Build the form with [`SearchSelect::new`] for a fixed list, or with
+/// [`SearchSelect::search`] to have a callback provide results for the current
+/// query. A thumbnail callback and other options can then be attached before
+/// calling [`run`](SearchSelect::run).
 pub struct SearchSelect<'a, T> {
     prompt: String,
     items: Vec<T>,
     entries: Vec<EntryInfo>,
     thumbnail: Option<ThumbnailCallback<'a, T>>,
     thumbnails: HashMap<usize, Option<Thumbnail>>,
+    search_spawner: Option<SearchSpawner<T>>,
+    pending_search: Option<Receiver<SearchMessage<T>>>,
+    search_due: Option<Instant>,
+    search_error: Option<String>,
+    spinner_frame: usize,
     input: Input,
     matches: Vec<usize>,
     selected: usize,
@@ -175,6 +230,11 @@ impl<'a, T: SelectItem> SearchSelect<'a, T> {
             entries,
             thumbnail: None,
             thumbnails: HashMap::new(),
+            search_spawner: None,
+            pending_search: None,
+            search_due: None,
+            search_error: None,
+            spinner_frame: 0,
             input: Input::default(),
             matches,
             selected: 0,
@@ -186,6 +246,111 @@ impl<'a, T: SelectItem> SearchSelect<'a, T> {
             cursor_pos: None,
             visible_rows: 0,
         }
+    }
+
+    /// Creates a form whose items are supplied by a search callback.
+    ///
+    /// The callback takes the current query, runs on a worker thread, and
+    /// returns the matching items. It is invoked after a short debounce and is
+    /// not called for empty queries. Errors are shown in the form.
+    ///
+    /// Use [`with_initial_query`](SearchSelect::with_initial_query) to start
+    /// with a query and an immediate search.
+    ///
+    /// ```no_run
+    /// use bookshelfman::forms::SearchSelect;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let selected = SearchSelect::search("Search", |query| {
+    ///     Ok(vec![format!("result for {query}")])
+    /// })
+    /// .with_initial_query("gatsby")
+    /// .run()?;
+    /// # let _ = selected;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn search(
+        prompt: impl Into<String>,
+        callback: impl Fn(String) -> std::result::Result<Vec<T>, SearchError> + Send + Sync + 'static,
+    ) -> Self
+    where
+        T: Send + 'static,
+    {
+        Self::new(prompt, std::iter::empty::<T>()).with_search(callback)
+    }
+
+    /// Sets a callback that loads the items for the current query.
+    ///
+    /// The callback runs on a worker thread, so it may block (for example on
+    /// network or disk I/O). Queries are debounced by 250 ms and stale
+    /// responses are discarded. A spinner is shown while a search is pending.
+    ///
+    /// Async clients can be driven from the worker thread, e.g. with a
+    /// `tokio::runtime::Handle` captured outside the callback.
+    pub fn with_search(
+        mut self,
+        callback: impl Fn(String) -> std::result::Result<Vec<T>, SearchError> + Send + Sync + 'static,
+    ) -> Self
+    where
+        T: Send + 'static,
+    {
+        let callback: Arc<
+            dyn Fn(String) -> std::result::Result<Vec<T>, SearchError> + Send + Sync,
+        > = Arc::new(callback);
+
+        let spawner: SearchSpawner<T> = Arc::new(move |query: String| {
+            let (sender, receiver) = mpsc::channel();
+            let thread_sender = sender.clone();
+            let thread_query = query.clone();
+            let callback = Arc::clone(&callback);
+
+            let spawned = std::thread::Builder::new()
+                .name("bookshelfman-search".to_string())
+                .spawn(move || {
+                    let result = callback(thread_query.clone());
+                    let _ = thread_sender.send((thread_query, result));
+                });
+
+            if let Err(error) = spawned {
+                let _ = sender.send((query, Err(Box::new(error))));
+            }
+
+            receiver
+        });
+
+        self.search_spawner = Some(spawner);
+        self.pending_search = None;
+        self.search_error = None;
+        self.spinner_frame = 0;
+        self.search_due = if self.input.value.trim().is_empty() {
+            None
+        } else {
+            Some(Instant::now())
+        };
+
+        self
+    }
+
+    /// Sets the initial query.
+    ///
+    /// With a search callback attached, this starts a search immediately. With
+    /// a fixed list, the list is filtered by the query.
+    pub fn with_initial_query(mut self, query: impl Into<String>) -> Self {
+        self.input.set_value(query.into());
+
+        if self.search_spawner.is_some() {
+            self.clear_search_results();
+            self.search_due = if self.input.value.trim().is_empty() {
+                None
+            } else {
+                Some(Instant::now())
+            };
+        } else {
+            self.refilter();
+        }
+
+        self
     }
 
     /// Sets the number of result rows shown at once (default: 8).
@@ -209,7 +374,7 @@ impl<'a, T: SelectItem> SearchSelect<'a, T> {
         self
     }
 
-    /// Sets the message shown when a non-empty query matches no items.
+    /// Sets the message shown by a fixed-list form when the list is empty.
     pub fn with_empty_message(mut self, message: impl Into<String>) -> Self {
         self.empty_message = message.into();
         self
@@ -240,10 +405,32 @@ impl<'a, T: SelectItem> SearchSelect<'a, T> {
     }
 
     fn event_loop(&mut self, session: &mut Session) -> Result<Option<usize>> {
-        loop {
-            session.draw(|frame| self.render(frame))?;
+        let mut dirty = true;
 
-            match event::read()? {
+        loop {
+            if self.tick() {
+                dirty = true;
+            }
+
+            if dirty {
+                session.draw(|frame| self.render(frame))?;
+                dirty = false;
+            }
+
+            let timeout = if self.is_searching() {
+                SEARCH_TICK
+            } else {
+                IDLE_POLL
+            };
+
+            if !event::poll(timeout)? {
+                continue;
+            }
+
+            let event = event::read()?;
+            dirty = true;
+
+            match event {
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Release {
                         continue;
@@ -257,12 +444,117 @@ impl<'a, T: SelectItem> SearchSelect<'a, T> {
                 }
                 Event::Paste(text) => {
                     self.input.insert_str(&text);
-                    self.refilter();
+                    self.on_query_changed();
                 }
                 Event::Resize(_, _) => {}
                 _ => {}
             }
         }
+    }
+
+    /// Advances search work and the spinner. Returns whether the form changed.
+    fn tick(&mut self) -> bool {
+        let mut changed = false;
+
+        if let Some(receiver) = self.pending_search.take() {
+            match receiver.try_recv() {
+                Ok((query, result)) => {
+                    if query == self.input.value {
+                        self.apply_search_result(result);
+                    }
+
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => {
+                    self.pending_search = Some(receiver);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.search_error = Some("search worker stopped unexpectedly".to_string());
+                    changed = true;
+                }
+            }
+        }
+
+        if let Some(due) = self.search_due
+            && Instant::now() >= due
+            && self.pending_search.is_none()
+        {
+            self.search_due = None;
+            self.start_search();
+            changed = true;
+        }
+
+        if self.is_searching() {
+            self.spinner_frame = self.spinner_frame.wrapping_add(1);
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn start_search(&mut self) {
+        let Some(spawner) = self.search_spawner.as_ref() else {
+            return;
+        };
+
+        self.search_error = None;
+        self.pending_search = Some(spawner(self.input.value.clone()));
+    }
+
+    fn apply_search_result(&mut self, result: std::result::Result<Vec<T>, SearchError>) {
+        match result {
+            Ok(items) => {
+                self.items = items;
+                self.entries = self
+                    .items
+                    .iter()
+                    .map(|item| EntryInfo::new(item))
+                    .collect::<Vec<_>>();
+                self.has_metadata = self.entries.iter().any(|entry| !entry.metadata.is_empty());
+                self.matches = (0..self.items.len()).collect::<Vec<_>>();
+                self.selected = 0;
+                *self.list_state.offset_mut() = 0;
+                self.list_state
+                    .select((!self.matches.is_empty()).then_some(0));
+                self.thumbnails.clear();
+                self.search_error = None;
+            }
+            Err(error) => {
+                self.items.clear();
+                self.entries.clear();
+                self.matches.clear();
+                self.selected = 0;
+                *self.list_state.offset_mut() = 0;
+                self.list_state.select(None);
+                self.thumbnails.clear();
+                self.has_metadata = false;
+                self.search_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn clear_search_results(&mut self) {
+        self.items.clear();
+        self.entries.clear();
+        self.matches.clear();
+        self.selected = 0;
+        *self.list_state.offset_mut() = 0;
+        self.list_state.select(None);
+        self.thumbnails.clear();
+        self.pending_search = None;
+        self.search_due = None;
+        self.search_error = None;
+        self.spinner_frame = 0;
+        self.has_metadata = false;
+    }
+
+    fn is_searching(&self) -> bool {
+        self.search_spawner.is_some()
+            && (self.search_due.is_some() || self.pending_search.is_some())
+    }
+
+    fn spinner(&self) -> &'static str {
+        SPINNER[self.spinner_frame % SPINNER.len()]
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<Outcome> {
@@ -290,38 +582,54 @@ impl<'a, T: SelectItem> SearchSelect<'a, T> {
             KeyCode::Right => self.input.move_right(),
             KeyCode::Backspace if control => {
                 if self.input.delete_word() {
-                    self.refilter();
+                    self.on_query_changed();
                 }
             }
             KeyCode::Backspace => {
                 if self.input.backspace() {
-                    self.refilter();
+                    self.on_query_changed();
                 }
             }
             KeyCode::Delete => {
                 if self.input.delete() {
-                    self.refilter();
+                    self.on_query_changed();
                 }
             }
             KeyCode::Char('u') if control => {
                 self.input.clear();
-                self.refilter();
+                self.on_query_changed();
             }
             KeyCode::Char('w') if control => {
                 if self.input.delete_word() {
-                    self.refilter();
+                    self.on_query_changed();
                 }
             }
             KeyCode::Char('a') if control => self.input.home(),
             KeyCode::Char('e') if control => self.input.end(),
             KeyCode::Char(ch) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
                 self.input.insert_char(ch);
-                self.refilter();
+                self.on_query_changed();
             }
             _ => {}
         }
 
         None
+    }
+
+    fn on_query_changed(&mut self) {
+        if self.search_spawner.is_some() {
+            self.clear_search_results();
+
+            if self.input.value.trim().is_empty() {
+                self.search_due = None;
+            } else {
+                self.search_due = Some(Instant::now() + SEARCH_DEBOUNCE);
+            }
+
+            self.spinner_frame = 0;
+        } else {
+            self.refilter();
+        }
     }
 
     fn refilter(&mut self) {
@@ -512,5 +820,80 @@ mod tests {
 
         form.handle_key(key(KeyCode::Home));
         assert_eq!(form.input.cursor, 0);
+    }
+
+    #[test]
+    fn search_callback_provides_results() {
+        let mut form =
+            SearchSelect::search("Search", |query| Ok(vec![format!("result for {query}")]));
+
+        form.input.set_value("gatsby");
+        form.on_query_changed();
+        form.search_due = Some(Instant::now());
+
+        let mut loaded = false;
+
+        for _ in 0..200 {
+            form.tick();
+
+            if form.items == vec!["result for gatsby".to_string()] {
+                loaded = true;
+                break;
+            }
+
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(loaded);
+        assert_eq!(form.matches, vec![0]);
+        assert!(form.search_error.is_none());
+        assert!(!form.is_searching());
+    }
+
+    #[test]
+    fn search_errors_are_reported() {
+        let mut form = SearchSelect::search(
+            "Search",
+            |_| -> std::result::Result<Vec<String>, SearchError> {
+                Err(Box::new(std::io::Error::other("boom")))
+            },
+        );
+
+        form.input.set_value("gatsby");
+        form.on_query_changed();
+        form.search_due = Some(Instant::now());
+
+        for _ in 0..200 {
+            form.tick();
+
+            if form.search_error.is_some() {
+                break;
+            }
+
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(form.search_error.as_deref(), Some("boom"));
+        assert!(form.matches.is_empty());
+        assert!(!form.is_searching());
+    }
+
+    #[test]
+    fn empty_queries_do_not_start_a_search() {
+        let mut form = SearchSelect::search("Search", |_| Ok(vec!["result".to_string()]));
+
+        form.input.set_value("");
+        form.on_query_changed();
+
+        assert!(!form.is_searching());
+    }
+
+    #[test]
+    fn an_initial_query_starts_the_search_immediately() {
+        let form = SearchSelect::search("Search", |_| Ok(vec!["result".to_string()]))
+            .with_initial_query("gatsby");
+
+        assert!(form.search_due.is_some());
+        assert!(form.is_searching());
     }
 }

@@ -57,23 +57,34 @@ impl<T: SelectItem> SearchSelect<'_, T> {
     }
 
     fn render_prompt(&self, frame: &mut Frame, area: Rect) {
-        let selected = self.selected.min(self.matches.len().saturating_sub(1));
-        let count = if self.matches.is_empty() {
-            "0/0".to_string()
+        let searching = self.is_searching();
+        let (status, status_style) = if searching {
+            (
+                format!("{} Searching…", self.spinner()),
+                Style::new().fg(ACCENT),
+            )
         } else {
-            format!("{}/{}", selected + 1, self.matches.len())
-        };
-        let count_width = u16::try_from(UnicodeWidthStr::width(count.as_str())).unwrap_or(u16::MAX);
+            let selected = self.selected.min(self.matches.len().saturating_sub(1));
+            let count = if self.matches.is_empty() {
+                "0/0".to_string()
+            } else {
+                format!("{}/{}", selected + 1, self.matches.len())
+            };
 
-        if count_width <= area.width {
-            let count_area = Rect::new(area.right() - count_width, area.y, count_width, 1);
+            (count, muted())
+        };
+        let status_width =
+            u16::try_from(UnicodeWidthStr::width(status.as_str())).unwrap_or(u16::MAX);
+
+        if status_width <= area.width {
+            let status_area = Rect::new(area.right() - status_width, area.y, status_width, 1);
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(count, muted()))).right_aligned(),
-                count_area,
+                Paragraph::new(Line::from(Span::styled(status, status_style))).right_aligned(),
+                status_area,
             );
         }
 
-        let prompt_width = area.width.saturating_sub(count_width).saturating_sub(2);
+        let prompt_width = area.width.saturating_sub(status_width).saturating_sub(2);
 
         if prompt_width == 0 {
             return;
@@ -155,6 +166,30 @@ impl<T: SelectItem> SearchSelect<'_, T> {
             return;
         }
 
+        if let Some(error) = &self.search_error {
+            self.list_state.select(None);
+            render_centered_line(
+                frame,
+                inner,
+                &format!("Search failed: {error}"),
+                Style::new().fg(Color::Red),
+            );
+
+            return;
+        }
+
+        if self.is_searching() {
+            self.list_state.select(None);
+            render_centered_line(
+                frame,
+                inner,
+                &format!("{} Searching…", self.spinner()),
+                Style::new().fg(ACCENT),
+            );
+
+            return;
+        }
+
         if self.matches.is_empty() {
             self.list_state.select(None);
             render_centered_line(frame, inner, &self.empty_message_text(), muted());
@@ -184,7 +219,13 @@ impl<T: SelectItem> SearchSelect<'_, T> {
     fn empty_message_text(&self) -> String {
         let query = self.input.value.trim();
 
-        if query.is_empty() {
+        if self.search_spawner.is_some() {
+            if query.is_empty() {
+                "Type to search…".to_string()
+            } else {
+                format!("No results for \"{query}\"")
+            }
+        } else if query.is_empty() {
             if self.entries.is_empty() {
                 "No options".to_string()
             } else {
@@ -201,6 +242,17 @@ impl<T: SelectItem> SearchSelect<'_, T> {
         frame.render_widget(block, area);
 
         if inner.is_empty() {
+            return;
+        }
+
+        if self.is_searching() {
+            render_centered_line(
+                frame,
+                inner,
+                &format!("{} Searching…", self.spinner()),
+                Style::new().fg(ACCENT),
+            );
+
             return;
         }
 
@@ -508,5 +560,19 @@ mod tests {
 
             terminal.draw(|frame| form.render(frame)).unwrap();
         }
+    }
+
+    #[test]
+    fn shows_searching_status_while_a_search_is_pending() {
+        let mut form = SearchSelect::search("Search", |_| Ok(vec!["result".to_string()]));
+        form.input.set_value("gatsby");
+        form.on_query_changed();
+
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| form.render(frame)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("Searching…"));
     }
 }

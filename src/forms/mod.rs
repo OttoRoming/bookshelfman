@@ -5,8 +5,9 @@
 //! screen, so output printed before the form stays on screen.
 //!
 //! The currently available form is [`search_select::SearchSelect`], a
-//! searchable single-select field.
+//! searchable single-select field. It can filter a fixed list locally or load
+//! results from a callback, showing a spinner while a search is in flight.
 
 pub mod search_select;
 
-pub use search_select::{Metadata, SearchSelect, SelectItem, Thumbnail};
+pub use search_select::{Metadata, SearchError, SearchSelect, SelectItem, Thumbnail};
