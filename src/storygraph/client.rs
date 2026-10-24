@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use url::Url;
@@ -8,6 +9,7 @@ use wreq::{Client, StatusCode};
 use wreq_util::{Emulation, Platform, Profile};
 
 use super::error::{Error, Result};
+use crate::cache::Cache;
 
 const HOME_URL: &str = "https://thestorygraph.com/";
 const APP_BASE_URL: &str = "https://app.thestorygraph.com";
@@ -57,12 +59,24 @@ pub struct Storygraph {
     client: Client,
     headers: HeaderMap,
     header_order: OrigHeaderMap,
+    cache: Arc<Cache>,
 }
 
 impl Storygraph {
-    /// Creates a client and performs the initial request needed to obtain the
-    /// StoryGraph session cookie.
+    /// Creates a client using the platform's default application cache and
+    /// performs the initial request needed to obtain the StoryGraph session
+    /// cookie.
     pub async fn new() -> Result<Self> {
+        let cache = Arc::new(Cache::open()?);
+
+        Self::new_with_cache(cache).await
+    }
+
+    /// Creates a client using a caller-provided cache.
+    ///
+    /// Use this to share one [`Cache`] between several clients or with the rest
+    /// of the application. [`Storygraph::new`] opens the default cache instead.
+    pub async fn new_with_cache(cache: Arc<Cache>) -> Result<Self> {
         let emulation = Emulation::builder()
             .profile(Profile::Firefox148)
             .platform(Platform::Linux)
@@ -79,6 +93,7 @@ impl Storygraph {
             client,
             headers: default_headers(),
             header_order: header_order(),
+            cache,
         };
 
         let response = storygraph
@@ -98,6 +113,11 @@ impl Storygraph {
         }
 
         Ok(storygraph)
+    }
+
+    /// Returns the cache used by this client.
+    pub fn cache(&self) -> &Cache {
+        &self.cache
     }
 
     pub(crate) async fn fetch(&self, path: &str, params: &[(&str, &str)]) -> Result<String> {

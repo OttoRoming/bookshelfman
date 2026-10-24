@@ -28,4 +28,7 @@ pub enum Error {
 
     #[error("author IDs are not valid UTF-8")]
     AuthorIds,
+
+    #[error(transparent)]
+    Cache(#[from] crate::cache::Error),
 }
